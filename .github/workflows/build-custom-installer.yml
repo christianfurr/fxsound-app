@@ -1,0 +1,77 @@
+name: Build custom FxSound installer
+
+on:
+  push:
+    branches: [feat/custom-routing-installer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-installer:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          sparse-checkout: |
+            fxsound
+            audiopassthru
+            dsp
+            bin/x64/Factsoft
+            Installer/CustomRouting
+            Installer/Resources/Fonts
+            Resources
+
+      - name: Install pinned JUCE 6.1.6 modules
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'JUCE-6.1.6.zip'
+          Invoke-WebRequest 'https://github.com/juce-framework/JUCE/archive/refs/tags/6.1.6.zip' -OutFile $archive
+          Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
+          New-Item -ItemType Directory -Path 'C:\JUCE' -Force | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'JUCE-6.1.6\modules') 'C:\JUCE\modules' -Recurse
+          if (-not (Test-Path 'C:\JUCE\modules\juce_core\juce_core.h')) { throw 'JUCE modules are missing.' }
+
+      - name: Build Windows Release x64 application
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'Visual C++ tools were not found.' }
+          & "$installation\MSBuild\Current\Bin\MSBuild.exe" 'fxsound\Project\FxSound.sln' /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal 2>&1 | Tee-Object -FilePath 'windows-build.log'
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
+
+      - name: Install verified Inno Setup compiler
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $download
+          $expected = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          if ((Get-FileHash $download -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Inno Setup checksum mismatch.' }
+          $process = Start-Process $download -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
+
+      - name: Package custom app and official driver prerequisite
+        shell: pwsh
+        run: |
+          .\Installer\CustomRouting\Build-Installer.ps1 -OutputDirectory "$env:GITHUB_WORKSPACE\installer-output"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: FxSound-Custom-Windows-x64
+          path: installer-output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-build-log
+          path: windows-build.log
+          if-no-files-found: ignore
+          retention-days: 7
